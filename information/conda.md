@@ -21,3 +21,5 @@ python -c "import torch_geometric; import esm; import pytorch_lightning; print('
 #
 pip install aiohttp==3.13.2 gitpython==3.1.45 sentry-sdk==2.48.0 torchdiffeq==0.2.5 opt-einsum==3.4.0 dm-tree==0.1.9
 pip install mdtraj
+pip uninstall -y setuptools
+pip install "setuptools<82"
