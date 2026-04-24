@@ -6,9 +6,10 @@ parser.add_argument('--pdb_id', nargs='*', default=[])
 parser.add_argument('--bb_only', action='store_true')
 parser.add_argument('--ca_only', action='store_true')
 parser.add_argument('--num_workers', type=int, default=1)
-parser.add_argument('--time', type=float, default=None,
-                    help='Target trajectory length in ns for ATLAS reference trimming. Example: --time 20 keeps the first 20 ns from each 100 ns / 10000 frame ATLAS replicate.')
-
+parser.add_argument('--start', type=int, default=0,
+                    help='Start frame (inclusive) for each ATLAS replicate.')
+parser.add_argument('--end', type=int, default=None,
+                    help='End frame (exclusive) for each ATLAS replicate. Default: use all remaining frames.')
 args = parser.parse_args()
 
 from sklearn.decomposition import PCA
@@ -21,8 +22,8 @@ from multiprocessing import Pool
 from scipy.optimize import linear_sum_assignment
 
 
-ATLAS_TOTAL_NS = 100.0
 ATLAS_TOTAL_FRAMES = 10000
+BASE_RAND1K = 1000
 
 
 def get_pca(xyz):
@@ -120,28 +121,29 @@ def align_tops_by_ca_order(top1, top2):
     return mask1, mask2
 
 
-def atlas_frames_for_time(time_ns, total_frames):
-    if time_ns is None:
-        return total_frames
-    if time_ns <= 0:
-        raise ValueError(f"--time must be > 0, got {time_ns}")
+def resolve_slice_indices(n_frames, start, end):
+    s = 0 if start is None else start
+    e = n_frames if end is None else end
 
-    target_frames = int(round(time_ns / ATLAS_TOTAL_NS * ATLAS_TOTAL_FRAMES))
-    target_frames = max(1, target_frames)
-    target_frames = min(target_frames, total_frames)
-    return target_frames
+    if s < 0:
+        s += n_frames
+    if e < 0:
+        e += n_frames
+
+    s = max(0, min(s, n_frames))
+    e = max(0, min(e, n_frames))
+
+    if e <= s:
+        raise ValueError(f"Invalid slice [{start}:{end}] resolved to [{s}:{e}] for total_frames={n_frames}")
+
+    return s, e
 
 
-def load_and_trim_atlas_xtc(xtc_path, topfile):
+def load_and_slice_atlas_xtc(xtc_path, topfile):
     traj = mdtraj.load(xtc_path, top=topfile)
-    keep_frames = atlas_frames_for_time(args.time, traj.n_frames)
-    if keep_frames < traj.n_frames:
-        print(f'Trimming {os.path.basename(xtc_path)}: keeping first {keep_frames}/{traj.n_frames} frames '
-              f'(~{args.time} ns out of {ATLAS_TOTAL_NS} ns)')
-        traj = traj[:keep_frames]
-    else:
-        print(f'Keeping all {traj.n_frames} frames from {os.path.basename(xtc_path)}')
-    return traj
+    s, e = resolve_slice_indices(traj.n_frames, args.start, args.end)
+    print(f'Slicing {os.path.basename(xtc_path)}: keeping frames [{s}:{e}:1] -> {e - s} frames')
+    return traj[s:e:1]
 
 
 def main(name):
@@ -152,11 +154,14 @@ def main(name):
         topfile = f'{args.atlas_dir}/{name}/{name}.pdb'
 
         print('Loading reference trajectory')
-        traj_r1 = load_and_trim_atlas_xtc(f'{args.atlas_dir}/{name}/{name}_prod_R1_fit.xtc', topfile)
-        traj_r2 = load_and_trim_atlas_xtc(f'{args.atlas_dir}/{name}/{name}_prod_R2_fit.xtc', topfile)
-        traj_r3 = load_and_trim_atlas_xtc(f'{args.atlas_dir}/{name}/{name}_prod_R3_fit.xtc', topfile)
+        traj_r1 = load_and_slice_atlas_xtc(f'{args.atlas_dir}/{name}/{name}_prod_R1_fit.xtc', topfile)
+        traj_r2 = load_and_slice_atlas_xtc(f'{args.atlas_dir}/{name}/{name}_prod_R2_fit.xtc', topfile)
+        traj_r3 = load_and_slice_atlas_xtc(f'{args.atlas_dir}/{name}/{name}_prod_R3_fit.xtc', topfile)
+
+        # 每條 replicate 先 slice，再 ensemble
         traj_aa = traj_r1 + traj_r2 + traj_r3
-        print(f'Loaded {traj_aa.n_frames} reference frames after trimming')
+        print(f'Loaded {traj_aa.n_frames} reference frames after slicing '
+              f'({traj_r1.n_frames} per replicate x 3 replicates)')
 
         print('Loading AF2 conformers')
         aftraj_aa = mdtraj.load(
@@ -210,10 +215,10 @@ def main(name):
         np.random.seed(137)
         RAND1 = np.random.randint(0, traj_aa.n_frames, aftraj_aa.n_frames)
         RAND2 = np.random.randint(0, traj_aa.n_frames, aftraj_aa.n_frames)
-        #
-        ATLAS_TOTAL_NS = 100.0
-        BASE_RAND1K = 1000
-        rand1k_n = int(round(BASE_RAND1K * (args.time / ATLAS_TOTAL_NS)))
+
+        # 用「單條 replicate slice 後長度 / 10000」等比例縮放
+        selected_len = traj_r1.n_frames
+        rand1k_n = int(round(BASE_RAND1K * (selected_len / ATLAS_TOTAL_FRAMES)))
         rand1k_n = max(1, rand1k_n)
         rand1k_n = min(rand1k_n, traj_aa.n_frames)
         RAND1K = np.random.randint(0, traj_aa.n_frames, rand1k_n)
